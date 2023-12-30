@@ -17,16 +17,16 @@ public class HidDataReader : IDisposable
     /// <summary>
     /// Creates new HID data reader.
     /// </summary>
-    /// <param name="window">Window instance, which will reveice the WM_INPUT messages</param>
+    /// <param name="window">Window instance, which will receive the WM_INPUT messages</param>
     public HidDataReader(Window window)
     {
         this.window = window ?? throw new ArgumentNullException("window");
         window.Closed += OnWindowClosed;
-        var handle = new WindowInteropHelper(window).Handle;
-        var source = HwndSource.FromHwnd(handle);
+        nint handle = new WindowInteropHelper(window).Handle;
+        HwndSource source = HwndSource.FromHwnd(handle);
         source.AddHook(WndProc);
 
-        var devices = RawInputHelper.GetDevices();
+        List<Device> devices = RawInputHelper.GetDevices();
 
         int i = 0;
         RAWINPUTDEVICE[] rids = new RAWINPUTDEVICE[devices.Count];
@@ -52,7 +52,7 @@ public class HidDataReader : IDisposable
 
     public static List<Device> GetDevices()
     {
-        var devices = RawInputHelper.GetDevices();
+        List<Device> devices = RawInputHelper.GetDevices();
         return devices;
     }
 
