@@ -1,8 +1,7 @@
-﻿namespace Djlastnight.Hid.UsageCollection
+﻿namespace Djlastnight.Hid.UsageCollection;
+
+public enum WindowsMediaCenter : ushort
 {
-    public enum WindowsMediaCenter : ushort
-    {
-        WindowsMediaCenterRemoteControl = 0x88,
-        WindowsMediaCenterLowLevel = 0x89
-    }
+    WindowsMediaCenterRemoteControl = 0x88,
+    WindowsMediaCenterLowLevel = 0x89
 }

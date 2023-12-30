@@ -1,11 +1,10 @@
-﻿namespace Djlastnight.Input
+﻿namespace Djlastnight.Input;
+
+public enum DeviceType : int
 {
-    public enum DeviceType : int
-    {
-        Other = 0,
-        Gamepad = 1,
-        Keyboard = 2,
-        VirtualKeyboard = 4,
-        Mouse = 8,
-    }
+    Other = 0,
+    Gamepad = 1,
+    Keyboard = 2,
+    VirtualKeyboard = 4,
+    Mouse = 8,
 }

@@ -1,691 +1,686 @@
-namespace Djlastnight.Hid
+namespace Djlastnight.Hid;
+
+using Djlastnight.Win32;
+using Djlastnight.Win32.Win32Hid;
+using Djlastnight.Win32.Win32RawInput;
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+
+public class HidEvent : IDisposable
 {
-    using System;
-    using System.Collections.Generic;
-    using System.ComponentModel;
-    using System.Diagnostics;
-    using System.Reflection;
-    using System.Runtime.InteropServices;
-    using System.Timers;
-    using System.Windows.Forms;
-    using Djlastnight.Hid.Usage;
-    using Djlastnight.Win32;
-    using Djlastnight.Win32.Win32Hid;
-    using Djlastnight.Win32.Win32RawInput;
+    private RAWINPUT rawInput;
 
-    public class HidEvent : IDisposable
+    /// <summary>
+    /// Initialize an HidEvent from a WM_INPUT message
+    /// </summary>
+    /// <param name="message"></param>
+    /// <param name="repeatDelegate"></param>
+    /// <param name="repeat"></param>
+    /// <param name="repeatDelayInMs"></param>
+    /// <param name="repeatSpeedInMs"></param>
+    internal HidEvent(Message message)
     {
-        private RAWINPUT rawInput;
+        RepeatCount = 0;
+        IsValid = false;
+        IsKeyboard = false;
+        IsGeneric = false;
 
-        /// <summary>
-        /// Initialize an HidEvent from a WM_INPUT message
-        /// </summary>
-        /// <param name="message"></param>
-        /// <param name="repeatDelegate"></param>
-        /// <param name="repeat"></param>
-        /// <param name="repeatDelayInMs"></param>
-        /// <param name="repeatSpeedInMs"></param>
-        internal HidEvent(Message message)
+        Time = DateTime.Now;
+        OriginalTime = DateTime.Now;
+        Usages = new List<ushort>();
+        UsageValues = new Dictionary<HIDP_VALUE_CAPS, uint>();
+
+        if (message.Msg != Contants.WM_INPUT)
         {
-            this.RepeatCount = 0;
-            this.IsValid = false;
-            this.IsKeyboard = false;
-            this.IsGeneric = false;
+            // Has to be a WM_INPUT message
+            return;
+        }
 
-            this.Time = DateTime.Now;
-            this.OriginalTime = DateTime.Now;
-            this.Usages = new List<ushort>();
-            this.UsageValues = new Dictionary<HIDP_VALUE_CAPS, uint>();
+        if (Helper.GET_RAWINPUT_CODE_WPARAM(message.WParam) == Contants.RIM_INPUT)
+        {
+            IsForeground = true;
+        }
+        else if (Helper.GET_RAWINPUT_CODE_WPARAM(message.WParam) == Contants.RIM_INPUTSINK)
+        {
+            IsForeground = false;
+        }
 
-            if (message.Msg != Contants.WM_INPUT)
+        // Declare some pointers
+        IntPtr rawInputBuffer = IntPtr.Zero;
+
+        try
+        {
+            // Fetch raw input
+            this.rawInput = new RAWINPUT();
+            if (!RawInputHelper.GetRawInputData(message.LParam, ref this.rawInput, ref rawInputBuffer))
             {
-                // Has to be a WM_INPUT message
+                Debug.WriteLine("GetRawInputData failed!");
                 return;
             }
 
-            if (Helper.GET_RAWINPUT_CODE_WPARAM(message.WParam) == Contants.RIM_INPUT)
+            // Our device can actually be null. This is notably happening for some keyboard events
+            if (RawInput.header.hDevice != IntPtr.Zero)
             {
-                this.IsForeground = true;
-            }
-            else if (Helper.GET_RAWINPUT_CODE_WPARAM(message.WParam) == Contants.RIM_INPUTSINK)
-            {
-                this.IsForeground = false;
+                Device = new Device(this.RawInput.header.hDevice);
             }
 
-            // Declare some pointers
-            IntPtr rawInputBuffer = IntPtr.Zero;
-
-            try
+            if (RawInput.header.dwType == RawInputDeviceType.RIM_TYPEHID)
             {
-                // Fetch raw input
-                this.rawInput = new RAWINPUT();
-                if (!RawInputHelper.GetRawInputData(message.LParam, ref this.rawInput, ref rawInputBuffer))
+                IsGeneric = true;
+
+                Debug.WriteLine("WM_INPUT source device is HID.");
+
+                // Get Usage Page and Usage
+                this.UsagePage = this.Device.Info.hid.usUsagePage;
+                this.UsageCollection = this.Device.Info.hid.usUsage;
+
+                /* Make sure our HID msg size more than 1.
+                 * In fact the first ushort is irrelevant to us for now
+                 * Check that we have at least one HID msg
+                */
+                if (!(RawInput.hid.dwSizeHid > 1
+                    && RawInput.hid.dwCount > 0))
                 {
-                    Debug.WriteLine("GetRawInputData failed!");
                     return;
                 }
 
-                // Our device can actually be null. This is notably happening for some keyboard events
-                if (this.RawInput.header.hDevice != IntPtr.Zero)
+                // Allocate a buffer for one HID input
+                this.InputReport = new byte[this.RawInput.hid.dwSizeHid];
+
+                Debug.WriteLine("Raw input contains " + this.RawInput.hid.dwCount + " HID input report(s)");
+
+                // For each HID input report in our raw input
+                for (int i = 0; i < this.RawInput.hid.dwCount; i++)
                 {
-                    this.Device = new Device(this.RawInput.header.hDevice);
-                }
-
-                if (this.RawInput.header.dwType == RawInputDeviceType.RIM_TYPEHID)
-                {
-                    this.IsGeneric = true;
-
-                    Debug.WriteLine("WM_INPUT source device is HID.");
-
-                    // Get Usage Page and Usage
-                    this.UsagePage = this.Device.Info.hid.usUsagePage;
-                    this.UsageCollection = this.Device.Info.hid.usUsage;
-
-                    /* Make sure our HID msg size more than 1.
-                     * In fact the first ushort is irrelevant to us for now
-                     * Check that we have at least one HID msg
-                    */
-                    if (!(this.RawInput.hid.dwSizeHid > 1
-                        && this.RawInput.hid.dwCount > 0))
+                    // Compute the address from which to copy our HID input
+                    int hidInputOffset;
+                    unsafe
                     {
-                        return;
+                        byte* source = (byte*)rawInputBuffer;
+                        source += sizeof(RAWINPUTHEADER) + sizeof(RAWHID) + (this.RawInput.hid.dwSizeHid * i);
+                        hidInputOffset = (int)source;
                     }
 
-                    // Allocate a buffer for one HID input
-                    this.InputReport = new byte[this.RawInput.hid.dwSizeHid];
+                    // Copy HID input into our buffer
+                    Marshal.Copy(new IntPtr(hidInputOffset), InputReport, 0, (int)RawInput.hid.dwSizeHid);
+                    ProcessInputReport(InputReport);
+                }
+            }
+            else if (this.RawInput.header.dwType == RawInputDeviceType.RIM_TYPEMOUSE)
+            {
+                IsMouse = true;
+                UsagePage = (ushort)Hid.UsagePage.GenericDesktopControls;
+                UsageCollection = (ushort)Hid.UsageCollection.GenericDesktop.Mouse;
 
-                    Debug.WriteLine("Raw input contains " + this.RawInput.hid.dwCount + " HID input report(s)");
+                Debug.WriteLine("WM_INPUT source device is Mouse.");
+            }
+            else if (this.RawInput.header.dwType == RawInputDeviceType.RIM_TYPEKEYBOARD)
+            {
+                this.IsKeyboard = true;
+                this.UsagePage = (ushort)Hid.UsagePage.GenericDesktopControls;
+                this.UsageCollection = (ushort)Hid.UsageCollection.GenericDesktop.Keyboard;
 
-                    // For each HID input report in our raw input
-                    for (int i = 0; i < this.RawInput.hid.dwCount; i++)
+                // Precise ALT key - work out if we are left or right ALT
+                if (this.rawInput.keyboard.VKey == (ushort)Keys.Menu)
+                {
+                    if (this.RawInput.keyboard.Flags.HasFlag(RawInputKeyFlags.RI_KEY_E0))
                     {
-                        // Compute the address from which to copy our HID input
-                        int hidInputOffset = 0;
-                        unsafe
-                        {
-                            byte* source = (byte*)rawInputBuffer;
-                            source += sizeof(RAWINPUTHEADER) + sizeof(RAWHID) + (this.RawInput.hid.dwSizeHid * i);
-                            hidInputOffset = (int)source;
-                        }
-
-                        // Copy HID input into our buffer
-                        Marshal.Copy(new IntPtr(hidInputOffset), this.InputReport, 0, (int)this.RawInput.hid.dwSizeHid);
-                        this.ProcessInputReport(this.InputReport);
+                        this.rawInput.keyboard.VKey = (ushort)Keys.RMenu;
+                    }
+                    else
+                    {
+                        this.rawInput.keyboard.VKey = (ushort)Keys.LMenu;
                     }
                 }
-                else if (this.RawInput.header.dwType == RawInputDeviceType.RIM_TYPEMOUSE)
+
+                // Precise CTRL key - work out if we are left or right CTRL
+                if (this.rawInput.keyboard.VKey == (ushort)Keys.ControlKey)
                 {
-                    this.IsMouse = true;
-                    this.UsagePage = (ushort)Hid.UsagePage.GenericDesktopControls;
-                    this.UsageCollection = (ushort)Hid.UsageCollection.GenericDesktop.Mouse;
-
-                    Debug.WriteLine("WM_INPUT source device is Mouse.");
-                }
-                else if (this.RawInput.header.dwType == RawInputDeviceType.RIM_TYPEKEYBOARD)
-                {
-                    this.IsKeyboard = true;
-                    this.UsagePage = (ushort)Hid.UsagePage.GenericDesktopControls;
-                    this.UsageCollection = (ushort)Hid.UsageCollection.GenericDesktop.Keyboard;
-
-                    // Precise ALT key - work out if we are left or right ALT
-                    if (this.rawInput.keyboard.VKey == (ushort)Keys.Menu)
+                    if (this.RawInput.keyboard.Flags.HasFlag(RawInputKeyFlags.RI_KEY_E0))
                     {
-                        if (this.RawInput.keyboard.Flags.HasFlag(RawInputKeyFlags.RI_KEY_E0))
-                        {
-                            this.rawInput.keyboard.VKey = (ushort)Keys.RMenu;
-                        }
-                        else
-                        {
-                            this.rawInput.keyboard.VKey = (ushort)Keys.LMenu;
-                        }
+                        this.rawInput.keyboard.VKey = (ushort)Keys.RControlKey;
                     }
-
-                    // Precise CTRL key - work out if we are left or right CTRL
-                    if (this.rawInput.keyboard.VKey == (ushort)Keys.ControlKey)
+                    else
                     {
-                        if (this.RawInput.keyboard.Flags.HasFlag(RawInputKeyFlags.RI_KEY_E0))
-                        {
-                            this.rawInput.keyboard.VKey = (ushort)Keys.RControlKey;
-                        }
-                        else
-                        {
-                            this.rawInput.keyboard.VKey = (ushort)Keys.LControlKey;
-                        }
-                    }
-
-                    // Precise SHIFT key - work out if we are left or right SHIFT
-                    if (this.rawInput.keyboard.VKey == (ushort)Keys.ShiftKey)
-                    {
-                        if (this.RawInput.keyboard.MakeCode == 0x0036)
-                        {
-                            this.rawInput.keyboard.VKey = (ushort)Keys.RShiftKey;
-                        }
-                        else
-                        {
-                            Debug.Assert(this.RawInput.keyboard.MakeCode == 0x002A, "Keyboard make code is different from 0x002A");
-                            this.rawInput.keyboard.VKey = (ushort)Keys.LShiftKey;
-                        }
-                    }
-
-                    Debug.WriteLine("WM_INPUT source device is Keyboard.");
-
-                    // Do keyboard handling...
-                    if (this.Device != null)
-                    {
-                        Debug.WriteLine("Type: " + this.Device.Info.keyboard.dwType.ToString());
-                        Debug.WriteLine("SubType: " + this.Device.Info.keyboard.dwSubType.ToString());
-                        Debug.WriteLine("Mode: " + this.Device.Info.keyboard.dwKeyboardMode.ToString());
-                        Debug.WriteLine("Number of function keys: " + this.Device.Info.keyboard.dwNumberOfFunctionKeys.ToString());
-                        Debug.WriteLine("Number of indicators: " + this.Device.Info.keyboard.dwNumberOfIndicators.ToString());
-                        Debug.WriteLine("Number of keys total: " + this.Device.Info.keyboard.dwNumberOfKeysTotal.ToString());
+                        this.rawInput.keyboard.VKey = (ushort)Keys.LControlKey;
                     }
                 }
-            }
-            finally
-            {
-                // Always executed when leaving our try block
-                Marshal.FreeHGlobal(rawInputBuffer);
-            }
 
-            this.IsValid = true;
-        }
-
-        public bool IsValid { get; private set; }
-
-        public bool IsForeground { get; private set; }
-
-        public bool IsBackground
-        {
-            get
-            {
-                return !this.IsForeground;
-            }
-        }
-
-        public bool IsMouse { get; private set; }
-
-        public bool IsKeyboard { get; private set; }
-
-        /// <summary>
-        /// If this not a mouse or keyboard event then it's a generic HID event.
-        /// </summary>
-        public bool IsGeneric { get; private set; }
-
-        public Keys VirtualKey
-        {
-            get { return (Keys)this.RawInput.keyboard.VKey; }
-        }
-
-        public bool HasModifierShift { get; set; }
-
-        public bool HasModifierControl { get; set; }
-
-        public bool HasModifierAlt { get; set; }
-
-        public bool HasModifierWindows { get; set; }
-
-        /// <summary>
-        /// Tells whether this event is a SHIFT modifier.
-        /// </summary>
-        public bool IsModifierShift
-        {
-            get
-            {
-                return this.IsKeyboard &&
-                       (this.VirtualKey == Keys.ShiftKey || this.VirtualKey == Keys.LShiftKey || this.VirtualKey == Keys.RShiftKey);
-            }
-        }
-
-        /// <summary>
-        /// Tells whether this event is a CONTROL modifier.
-        /// </summary>
-        public bool IsModifierControl
-        {
-            get
-            {
-                return this.IsKeyboard &&
-                       (this.VirtualKey == Keys.ControlKey ||
-                       this.VirtualKey == Keys.LControlKey ||
-                        this.VirtualKey == Keys.RControlKey);
-            }
-        }
-
-        /// <summary>
-        /// Tells whether this event is a ALT modifier.
-        /// </summary>
-        public bool IsModifierAlt
-        {
-            get
-            {
-                return this.IsKeyboard && (this.VirtualKey == Keys.Menu || this.VirtualKey == Keys.LMenu || this.VirtualKey == Keys.RMenu);
-            }
-        }
-
-        /// <summary>
-        /// Tells whether this event is a WINDOWS modifier.
-        /// </summary>
-        public bool IsModifierWindows
-        {
-            get { return this.IsKeyboard && (this.VirtualKey == Keys.LWin || this.VirtualKey == Keys.RWin); }
-        }
-
-        /// <summary>
-        /// Tells whether this is a modifier key.
-        /// </summary>
-        public bool IsModifier
-        {
-            get { return this.IsModifierShift || this.IsModifierControl || this.IsModifierAlt || this.IsModifierWindows; }
-        }
-
-        /// <summary>
-        /// Check if this event correspond to a button or a key being pushed down.
-        /// </summary>
-        public bool IsButtonDown
-        {
-            get
-            {
-                if (this.IsGeneric)
+                // Precise SHIFT key - work out if we are left or right SHIFT
+                if (this.rawInput.keyboard.VKey == (ushort)Keys.ShiftKey)
                 {
-                    // For generic HID device check that our first usage is not zero
-                    return this.Usages.Count == 1 && this.Usages[0] != 0;
-                }
-                else if (this.IsKeyboard)
-                {
-                    return !this.IsButtonUp;
+                    if (this.RawInput.keyboard.MakeCode == 0x0036)
+                    {
+                        this.rawInput.keyboard.VKey = (ushort)Keys.RShiftKey;
+                    }
+                    else
+                    {
+                        Debug.Assert(this.RawInput.keyboard.MakeCode == 0x002A, "Keyboard make code is different from 0x002A");
+                        this.rawInput.keyboard.VKey = (ushort)Keys.LShiftKey;
+                    }
                 }
 
-                Debug.Assert(false, "TODO: mouse handling");
-                return false;
-            }
-        }
+                Debug.WriteLine("WM_INPUT source device is Keyboard.");
 
-        /// <summary>
-        /// Check if this event correspond to a button or a key being released.
-        /// </summary>
-        public bool IsButtonUp
-        {
-            get
-            {
-                if (this.IsGeneric)
+                // Do keyboard handling...
+                if (this.Device != null)
                 {
-                    // Button up event if we do not have any usages
-                    return this.Usages.Count == 0;
+                    Debug.WriteLine("Type: " + this.Device.Info.keyboard.dwType.ToString());
+                    Debug.WriteLine("SubType: " + this.Device.Info.keyboard.dwSubType.ToString());
+                    Debug.WriteLine("Mode: " + this.Device.Info.keyboard.dwKeyboardMode.ToString());
+                    Debug.WriteLine("Number of function keys: " + this.Device.Info.keyboard.dwNumberOfFunctionKeys.ToString());
+                    Debug.WriteLine("Number of indicators: " + this.Device.Info.keyboard.dwNumberOfIndicators.ToString());
+                    Debug.WriteLine("Number of keys total: " + this.Device.Info.keyboard.dwNumberOfKeysTotal.ToString());
                 }
-                else if (this.IsKeyboard)
-                {
-                    // This is a key up event if our break flag is set
-                    return this.RawInput.keyboard.Flags.HasFlag(RawInputKeyFlags.RI_KEY_BREAK);
-                }
-
-                Debug.Assert(false, "TODO: mouse handling");
-                return false;
             }
         }
-
-        public bool IsRepeat
+        finally
         {
-            get
-            {
-                return this.RepeatCount != 0;
-            }
+            // Always executed when leaving our try block
+            Marshal.FreeHGlobal(rawInputBuffer);
         }
 
-        public uint RepeatCount { get; set; }
+        this.IsValid = true;
+    }
 
-        /// <summary>
-        /// Uniquely identify keyboard events.
-        /// Key down and up event will return the same ID.
-        /// </summary>
-        public ulong KeyId
+    public bool IsValid { get; private set; }
+
+    public bool IsForeground { get; private set; }
+
+    public bool IsBackground
+    {
+        get
         {
-            get
-            {
-                return (ulong)this.RawInput.keyboard.VKey << 32 | (ulong)this.RawInput.keyboard.MakeCode << 16 | (ulong)(this.RawInput.keyboard.Flags & ~RawInputKeyFlags.RI_KEY_BREAK);
-            }
+            return !this.IsForeground;
         }
+    }
 
-        public Device Device { get; private set; }
+    public bool IsMouse { get; private set; }
 
-        public RAWINPUT RawInput
+    public bool IsKeyboard { get; private set; }
+
+    /// <summary>
+    /// If this not a mouse or keyboard event then it's a generic HID event.
+    /// </summary>
+    public bool IsGeneric { get; private set; }
+
+    public Keys VirtualKey
+    {
+        get { return (Keys)this.RawInput.keyboard.VKey; }
+    }
+
+    public bool HasModifierShift { get; set; }
+
+    public bool HasModifierControl { get; set; }
+
+    public bool HasModifierAlt { get; set; }
+
+    public bool HasModifierWindows { get; set; }
+
+    /// <summary>
+    /// Tells whether this event is a SHIFT modifier.
+    /// </summary>
+    public bool IsModifierShift
+    {
+        get
         {
-            get
-            {
-                return this.rawInput;
-            }
+            return this.IsKeyboard &&
+                   (this.VirtualKey == Keys.ShiftKey || this.VirtualKey == Keys.LShiftKey || this.VirtualKey == Keys.RShiftKey);
         }
+    }
 
-        /// <summary>
-        /// Usage Page
-        /// </summary>
-        public ushort UsagePage { get; private set; }
-
-        /// <summary>
-        /// Usage Page as enumeration.
-        /// </summary>
-        public UsagePage UsagePageEnum
+    /// <summary>
+    /// Tells whether this event is a CONTROL modifier.
+    /// </summary>
+    public bool IsModifierControl
+    {
+        get
         {
-            get
-            {
-                return (UsagePage)this.UsagePage;
-            }
+            return this.IsKeyboard &&
+                   (this.VirtualKey == Keys.ControlKey ||
+                   this.VirtualKey == Keys.LControlKey ||
+                    this.VirtualKey == Keys.RControlKey);
         }
+    }
 
-        /// <summary>
-        /// Usage Collection
-        /// </summary>
-        public ushort UsageCollection { get; private set; }
-
-        public List<ushort> Usages { get; private set; }
-
-        public uint UsageId
+    /// <summary>
+    /// Tells whether this event is a ALT modifier.
+    /// </summary>
+    public bool IsModifierAlt
+    {
+        get
         {
-            get
-            {
-                return (uint)this.UsagePage << 16 | (uint)this.UsageCollection;
-            }
+            return this.IsKeyboard && (this.VirtualKey == Keys.Menu || this.VirtualKey == Keys.LMenu || this.VirtualKey == Keys.RMenu);
         }
+    }
 
-        /// <summary>
-        /// Sorted in the same order as Device.InputValueCapabilities.
-        /// </summary>
-        public Dictionary<HIDP_VALUE_CAPS, uint> UsageValues { get; private set; }
+    /// <summary>
+    /// Tells whether this event is a WINDOWS modifier.
+    /// </summary>
+    public bool IsModifierWindows
+    {
+        get { return this.IsKeyboard && (this.VirtualKey == Keys.LWin || this.VirtualKey == Keys.RWin); }
+    }
 
-        public byte[] InputReport { get; private set; }
+    /// <summary>
+    /// Tells whether this is a modifier key.
+    /// </summary>
+    public bool IsModifier
+    {
+        get { return this.IsModifierShift || this.IsModifierControl || this.IsModifierAlt || this.IsModifierWindows; }
+    }
 
-        public DateTime Time { get; private set; }
-
-        public DateTime OriginalTime { get; private set; }
-
-        /// <summary>
-        /// We typically dispose of events as soon as we get the corresponding key up signal.
-        /// </summary>
-        public void Dispose()
+    /// <summary>
+    /// Check if this event correspond to a button or a key being pushed down.
+    /// </summary>
+    public bool IsButtonDown
+    {
+        get
         {
-        }
-
-        /// <summary>
-        /// 
-        /// </summary>
-        /// <returns></returns>
-        public override string ToString()
-        {
-            var result = string.Empty;
-            if (!this.IsValid)
-            {
-                result += "HID Event Invalid";
-                return result;
-            }
-
-            result += "HID Event";
-            if (this.IsButtonDown)
-            {
-                result += ", DOWN";
-            }
-
-            if (this.IsButtonUp)
-            {
-                result += ", UP";
-            }
-
             if (this.IsGeneric)
             {
-                result += ", Generic";
-                for (int i = 0; i < this.Usages.Count; i++)
-                {
-                    result += ", Usage: " + this.UsageNameAndValue(i);
-                }
-
-                result += ", UsagePage: " + this.UsagePageNameAndValue();
-                result += ", UsageCollection: " + this.UsageCollectionNameAndValue();
-                result += ", Input Report: 0x" + this.InputReportString();
+                // For generic HID device check that our first usage is not zero
+                return this.Usages.Count == 1 && this.Usages[0] != 0;
             }
             else if (this.IsKeyboard)
             {
-                result += ", Keyboard";
-                result += ", Virtual Key: " + this.VirtualKey;
-            }
-            else if (this.IsMouse)
-            {
-                result += ", Mouse";
+                return !this.IsButtonUp;
             }
 
-            if (this.IsBackground)
+            Debug.Assert(false, "TODO: mouse handling");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Check if this event correspond to a button or a key being released.
+    /// </summary>
+    public bool IsButtonUp
+    {
+        get
+        {
+            if (this.IsGeneric)
             {
-                result += ", Background";
+                // Button up event if we do not have any usages
+                return this.Usages.Count == 0;
+            }
+            else if (this.IsKeyboard)
+            {
+                // This is a key up event if our break flag is set
+                return this.RawInput.keyboard.Flags.HasFlag(RawInputKeyFlags.RI_KEY_BREAK);
             }
 
-            if (this.IsRepeat)
-            {
-                result += ", Repeat: " + this.RepeatCount;
-            }
+            Debug.Assert(false, "TODO: mouse handling");
+            return false;
+        }
+    }
 
+    public bool IsRepeat
+    {
+        get
+        {
+            return this.RepeatCount != 0;
+        }
+    }
+
+    public uint RepeatCount { get; set; }
+
+    /// <summary>
+    /// Uniquely identify keyboard events.
+    /// Key down and up event will return the same ID.
+    /// </summary>
+    public ulong KeyId
+    {
+        get
+        {
+            return (ulong)this.RawInput.keyboard.VKey << 32 | (ulong)this.RawInput.keyboard.MakeCode << 16 | (ulong)(this.RawInput.keyboard.Flags & ~RawInputKeyFlags.RI_KEY_BREAK);
+        }
+    }
+
+    public Device Device { get; private set; }
+
+    public RAWINPUT RawInput
+    {
+        get
+        {
+            return this.rawInput;
+        }
+    }
+
+    /// <summary>
+    /// Usage Page
+    /// </summary>
+    public ushort UsagePage { get; private set; }
+
+    /// <summary>
+    /// Usage Page as enumeration.
+    /// </summary>
+    public UsagePage UsagePageEnum
+    {
+        get
+        {
+            return (UsagePage)this.UsagePage;
+        }
+    }
+
+    /// <summary>
+    /// Usage Collection
+    /// </summary>
+    public ushort UsageCollection { get; private set; }
+
+    public List<ushort> Usages { get; private set; }
+
+    public uint UsageId
+    {
+        get
+        {
+            return (uint)this.UsagePage << 16 | (uint)this.UsageCollection;
+        }
+    }
+
+    /// <summary>
+    /// Sorted in the same order as Device.InputValueCapabilities.
+    /// </summary>
+    public Dictionary<HIDP_VALUE_CAPS, uint> UsageValues { get; private set; }
+
+    public byte[] InputReport { get; private set; }
+
+    public DateTime Time { get; private set; }
+
+    public DateTime OriginalTime { get; private set; }
+
+    /// <summary>
+    /// We typically dispose of events as soon as we get the corresponding key up signal.
+    /// </summary>
+    public void Dispose()
+    {
+    }
+
+    /// <summary>
+    /// 
+    /// </summary>
+    /// <returns></returns>
+    public override string ToString()
+    {
+        var result = string.Empty;
+        if (!this.IsValid)
+        {
+            result += "HID Event Invalid";
             return result;
         }
 
-        /// <summary>
-        /// Provides the name of our usage page.
-        /// </summary>
-        internal string UsagePageName()
+        result += "HID Event";
+        if (this.IsButtonDown)
         {
-            return this.UsagePageEnum.ToString();
+            result += ", DOWN";
         }
 
-        /// <summary>
-        /// Provides name and value of our usage page as a string.
-        /// </summary>
-        internal string UsagePageNameAndValue()
+        if (this.IsButtonUp)
         {
-            return string.Format("{0} (0x{1})", this.UsagePageName(), this.UsagePage.ToString("X4"));
+            result += ", UP";
         }
 
-        /// <summary>
-        /// Provides the name of our usage collection.
-        /// </summary>
-        internal string UsageCollectionName()
+        if (this.IsGeneric)
         {
-            Type collectionType = Utils.UsageCollectionType(this.UsagePageEnum);
-            return Enum.GetName(collectionType, this.UsageCollection);
-        }
-
-        /// <summary>
-        /// Provides name and value of our usage collection as a string.
-        /// </summary>
-        internal string UsageCollectionNameAndValue()
-        {
-            return string.Format("{0} (0x{1})", this.UsageCollectionName(), this.UsageCollection.ToString("X4"));
-        }
-
-        /// <summary>
-        /// Provides name of the usage at the given index.
-        /// </summary>
-        /// <param name="index">Index of the usage concerned.</param>
-        /// <returns></returns>
-        internal string UsageName(int index)
-        {
-            Type usageType = Utils.UsageType(this.UsagePageEnum);
-            return Enum.GetName(usageType, this.Usages[index]);
-        }
-
-        /// <summary>
-        /// Provides name and value of the usage at the given index.
-        /// </summary>
-        /// <param name="index">Index of the usage concerned.</param>
-        /// <returns></returns>
-        internal string UsageNameAndValue(int index)
-        {
-            return string.Format("{0} (0x{1})", this.UsageName(index), this.Usages[index].ToString("X4"));
-        }
-
-        /// <summary>
-        /// 
-        /// </summary>
-        /// <param name="usagePage"></param>
-        /// <param name="Usage"></param>
-        /// <returns></returns>
-        internal uint GetUsageValue(ushort usagePage, ushort usage)
-        {
-            foreach (HIDP_VALUE_CAPS caps in this.Device.InputValueCapabilities)
+            result += ", Generic";
+            for (int i = 0; i < this.Usages.Count; i++)
             {
-                if (caps.IsRange)
-                {
-                    // What should we do with those guys?
-                    continue;
-                }
-
-                // Check if we have a match
-                if (caps.UsagePage == usagePage && caps.NotRange.Usage == usage)
-                {
-                    return this.UsageValues[caps];
-                }
+                result += ", Usage: " + this.UsageNameAndValue(i);
             }
 
-            return 0;
+            result += ", UsagePage: " + this.UsagePageNameAndValue();
+            result += ", UsageCollection: " + this.UsageCollectionNameAndValue();
+            result += ", Input Report: 0x" + this.InputReportString();
+        }
+        else if (this.IsKeyboard)
+        {
+            result += ", Keyboard";
+            result += ", Virtual Key: " + this.VirtualKey;
+        }
+        else if (this.IsMouse)
+        {
+            result += ", Mouse";
         }
 
-        /// <summary>
-        /// 
-        /// </summary>
-        /// <param name="usagePage"></param>
-        /// <param name="usage"></param>
-        /// <returns></returns>
-        internal int GetValueCapabilitiesIndex(ushort usagePage, ushort usage)
+        if (this.IsBackground)
         {
-            int i = -1;
+            result += ", Background";
+        }
 
-            // Make sure we have a device with input value capabilities
-            if (this.Device == null || this.Device.InputValueCapabilities == null)
+        if (this.IsRepeat)
+        {
+            result += ", Repeat: " + this.RepeatCount;
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Provides the name of our usage page.
+    /// </summary>
+    internal string UsagePageName()
+    {
+        return this.UsagePageEnum.ToString();
+    }
+
+    /// <summary>
+    /// Provides name and value of our usage page as a string.
+    /// </summary>
+    internal string UsagePageNameAndValue()
+    {
+        return string.Format("{0} (0x{1})", this.UsagePageName(), this.UsagePage.ToString("X4"));
+    }
+
+    /// <summary>
+    /// Provides the name of our usage collection.
+    /// </summary>
+    internal string UsageCollectionName()
+    {
+        Type collectionType = Utils.UsageCollectionType(this.UsagePageEnum);
+        return Enum.GetName(collectionType, this.UsageCollection);
+    }
+
+    /// <summary>
+    /// Provides name and value of our usage collection as a string.
+    /// </summary>
+    internal string UsageCollectionNameAndValue()
+    {
+        return string.Format("{0} (0x{1})", this.UsageCollectionName(), this.UsageCollection.ToString("X4"));
+    }
+
+    /// <summary>
+    /// Provides name of the usage at the given index.
+    /// </summary>
+    /// <param name="index">Index of the usage concerned.</param>
+    /// <returns></returns>
+    internal string UsageName(int index)
+    {
+        Type usageType = Utils.UsageType(this.UsagePageEnum);
+        return Enum.GetName(usageType, this.Usages[index]);
+    }
+
+    /// <summary>
+    /// Provides name and value of the usage at the given index.
+    /// </summary>
+    /// <param name="index">Index of the usage concerned.</param>
+    /// <returns></returns>
+    internal string UsageNameAndValue(int index)
+    {
+        return string.Format("{0} (0x{1})", this.UsageName(index), this.Usages[index].ToString("X4"));
+    }
+
+    /// <summary>
+    /// 
+    /// </summary>
+    /// <param name="usagePage"></param>
+    /// <param name="Usage"></param>
+    /// <returns></returns>
+    internal uint GetUsageValue(ushort usagePage, ushort usage)
+    {
+        foreach (HIDP_VALUE_CAPS caps in this.Device.InputValueCapabilities)
+        {
+            if (caps.IsRange)
             {
-                return i;
+                // What should we do with those guys?
+                continue;
             }
 
-            // Search our value capabilities for the first one matching usage and usage page
-            foreach (HIDP_VALUE_CAPS caps in this.Device.InputValueCapabilities)
+            // Check if we have a match
+            if (caps.UsagePage == usagePage && caps.NotRange.Usage == usage)
             {
-                i++;
-                if (caps.IsRange)
-                {
-                    // What should we do with those guys?
-                    continue;
-                }
-
-                // Check if we have a match
-                if (caps.UsagePage == usagePage && caps.NotRange.Usage == usage)
-                {
-                    return i;
-                }
+                return this.UsageValues[caps];
             }
+        }
 
+        return 0;
+    }
+
+    /// <summary>
+    /// 
+    /// </summary>
+    /// <param name="usagePage"></param>
+    /// <param name="usage"></param>
+    /// <returns></returns>
+    internal int GetValueCapabilitiesIndex(ushort usagePage, ushort usage)
+    {
+        int i = -1;
+
+        // Make sure we have a device with input value capabilities
+        if (this.Device == null || this.Device.InputValueCapabilities == null)
+        {
             return i;
         }
 
-        /// <summary>
-        /// 
-        /// </summary>
-        /// <returns></returns>
-        internal string InputReportString()
+        // Search our value capabilities for the first one matching usage and usage page
+        foreach (HIDP_VALUE_CAPS caps in this.Device.InputValueCapabilities)
         {
-            if (this.InputReport == null)
+            i++;
+            if (caps.IsRange)
             {
-                return "null";
+                // What should we do with those guys?
+                continue;
             }
 
-            var hidDump = string.Empty;
-            foreach (byte b in this.InputReport)
+            // Check if we have a match
+            if (caps.UsagePage == usagePage && caps.NotRange.Usage == usage)
             {
-                hidDump += b.ToString("X2");
-            }
-
-            return hidDump;
-        }
-
-        /// <summary>
-        /// Print information about this device to our debug output.
-        /// </summary>
-        [Conditional("DEBUG")]
-        internal void DebugWrite()
-        {
-            Debug.Write(this.ToString());
-        }
-
-        /// <summary>
-        /// 
-        /// </summary>
-        private void ProcessInputReport(byte[] inputReport)
-        {
-            /// Get all our usages, those are typically the buttons currently pushed on a gamepad.
-            /// For a remote control it's usually just the one button that was pushed.
-            this.GetUsages(inputReport);
-
-            // Now process direction pad (d-pad, dpad) and axes
-            this.GetUsageValues(inputReport);
-        }
-
-        /// <summary>
-        /// Typically fetches values of a joystick/gamepad axis and dpad directions.
-        /// </summary>
-        /// <param name="inputReport"></param>
-        private void GetUsageValues(byte[] inputReport)
-        {
-            if (this.Device.InputValueCapabilities == null)
-            {
-                return;
-            }
-
-            foreach (HIDP_VALUE_CAPS caps in this.Device.InputValueCapabilities)
-            {
-                if (caps.IsRange)
-                {
-                    // What should we do with those guys?
-                    continue;
-                }
-
-                // Now fetch and add our usage value
-                uint usageValue = 0;
-                HidStatus status = Win32.Win32Hid.NativeMethods.HidP_GetUsageValue(HIDP_REPORT_TYPE.HidP_Input, caps.UsagePage, caps.LinkCollection, caps.NotRange.Usage, ref usageValue, this.Device.PreParsedData, inputReport, (uint)inputReport.Length);
-                if (status == HidStatus.HIDP_STATUS_SUCCESS)
-                {
-                    this.UsageValues[caps] = usageValue;
-                }
+                return i;
             }
         }
 
-        /// <summary>
+        return i;
+    }
+
+    /// <summary>
+    /// 
+    /// </summary>
+    /// <returns></returns>
+    internal string InputReportString()
+    {
+        if (this.InputReport == null)
+        {
+            return "null";
+        }
+
+        var hidDump = string.Empty;
+        foreach (byte b in this.InputReport)
+        {
+            hidDump += b.ToString("X2");
+        }
+
+        return hidDump;
+    }
+
+    /// <summary>
+    /// Print information about this device to our debug output.
+    /// </summary>
+    [Conditional("DEBUG")]
+    internal void DebugWrite()
+    {
+        Debug.Write(this.ToString());
+    }
+
+    /// <summary>
+    /// 
+    /// </summary>
+    private void ProcessInputReport(byte[] inputReport)
+    {
         /// Get all our usages, those are typically the buttons currently pushed on a gamepad.
         /// For a remote control it's usually just the one button that was pushed.
-        /// </summary>
-        private void GetUsages(byte[] inputReport)
+        this.GetUsages(inputReport);
+
+        // Now process direction pad (d-pad, dpad) and axes
+        this.GetUsageValues(inputReport);
+    }
+
+    /// <summary>
+    /// Typically fetches values of a joystick/gamepad axis and dpad directions.
+    /// </summary>
+    /// <param name="inputReport"></param>
+    private void GetUsageValues(byte[] inputReport)
+    {
+        if (this.Device.InputValueCapabilities == null)
         {
-            /// Do proper parsing of our HID report
-            /// First query our usage count
-            uint usageCount = 0;
-            USAGE_AND_PAGE[] usages = null;
-            HidStatus status = Win32.Win32Hid.NativeMethods.HidP_GetUsagesEx(HIDP_REPORT_TYPE.HidP_Input, 0, usages, ref usageCount, this.Device.PreParsedData, inputReport, (uint)inputReport.Length);
-            if (status == HidStatus.HIDP_STATUS_BUFFER_TOO_SMALL)
-            {
-                // Allocate a large enough buffer 
-                usages = new USAGE_AND_PAGE[usageCount];
+            return;
+        }
 
-                // ...and fetch our usages
-                status = Win32.Win32Hid.NativeMethods.HidP_GetUsagesEx(HIDP_REPORT_TYPE.HidP_Input, 0, usages, ref usageCount, this.Device.PreParsedData, inputReport, (uint)inputReport.Length);
-                if (status != HidStatus.HIDP_STATUS_SUCCESS)
-                {
-                    Debug.WriteLine("Second pass could not parse HID data: " + status.ToString());
-                }
-            }
-            else if (status != HidStatus.HIDP_STATUS_SUCCESS)
+        foreach (HIDP_VALUE_CAPS caps in this.Device.InputValueCapabilities)
+        {
+            if (caps.IsRange)
             {
-                Debug.WriteLine("First pass could not parse HID data: " + status.ToString());
+                // What should we do with those guys?
+                continue;
             }
 
-            Debug.WriteLine("Usage count: " + usageCount.ToString());
-
-            // Copy usages into this event
-            if (usages != null)
+            // Now fetch and add our usage value
+            uint usageValue = 0;
+            HidStatus status = Win32.Win32Hid.NativeMethods.HidP_GetUsageValue(HIDP_REPORT_TYPE.HidP_Input, caps.UsagePage, caps.LinkCollection, caps.NotRange.Usage, ref usageValue, this.Device.PreParsedData, inputReport, (uint)inputReport.Length);
+            if (status == HidStatus.HIDP_STATUS_SUCCESS)
             {
-                foreach (USAGE_AND_PAGE up in usages)
-                {
-                    this.Usages.Add(up.Usage);
-                }
+                this.UsageValues[caps] = usageValue;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Get all our usages, those are typically the buttons currently pushed on a gamepad.
+    /// For a remote control it's usually just the one button that was pushed.
+    /// </summary>
+    private void GetUsages(byte[] inputReport)
+    {
+        /// Do proper parsing of our HID report
+        /// First query our usage count
+        uint usageCount = 0;
+        USAGE_AND_PAGE[] usages = null;
+        HidStatus status = Win32.Win32Hid.NativeMethods.HidP_GetUsagesEx(HIDP_REPORT_TYPE.HidP_Input, 0, usages, ref usageCount, this.Device.PreParsedData, inputReport, (uint)inputReport.Length);
+        if (status == HidStatus.HIDP_STATUS_BUFFER_TOO_SMALL)
+        {
+            // Allocate a large enough buffer 
+            usages = new USAGE_AND_PAGE[usageCount];
+
+            // ...and fetch our usages
+            status = Win32.Win32Hid.NativeMethods.HidP_GetUsagesEx(HIDP_REPORT_TYPE.HidP_Input, 0, usages, ref usageCount, this.Device.PreParsedData, inputReport, (uint)inputReport.Length);
+            if (status != HidStatus.HIDP_STATUS_SUCCESS)
+            {
+                Debug.WriteLine("Second pass could not parse HID data: " + status.ToString());
+            }
+        }
+        else if (status != HidStatus.HIDP_STATUS_SUCCESS)
+        {
+            Debug.WriteLine("First pass could not parse HID data: " + status.ToString());
+        }
+
+        Debug.WriteLine("Usage count: " + usageCount.ToString());
+
+        // Copy usages into this event
+        if (usages != null)
+        {
+            foreach (USAGE_AND_PAGE up in usages)
+            {
+                this.Usages.Add(up.Usage);
             }
         }
     }

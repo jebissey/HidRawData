@@ -1,4 +1,3 @@
-﻿namespace Djlastnight.Hid
-{
-    internal delegate void HidRepeatEventHandler(HidEvent aHidEvent);
-}
+﻿namespace Djlastnight.Hid;
+
+internal delegate void HidRepeatEventHandler(HidEvent aHidEvent);

@@ -1,23 +1,22 @@
-﻿namespace Djlastnight.Input.Internal
+﻿namespace Djlastnight.Input.Internal;
+
+using System.Management;
+
+internal static class Extensions
 {
-    using System.Management;
-
-    internal static class Extensions
+    public static Win32_PnPEntity ToPnpEntity(this ManagementBaseObject input)
     {
-        public static Win32_PnPEntity ToPnpEntity(this ManagementBaseObject input)
+        var output = new Win32_PnPEntity();
+        foreach (var prop in input.Properties)
         {
-            var output = new Win32_PnPEntity();
-            foreach (var prop in input.Properties)
+            if (prop.Value == null)
             {
-                if (prop.Value == null)
-                {
-                    continue;
-                }
-
-                output.SetValue(prop.Name, prop.Value);
+                continue;
             }
 
-            return output;
+            output.SetValue(prop.Name, prop.Value);
         }
+
+        return output;
     }
 }
